@@ -11,6 +11,10 @@ Works with the **[Blender VCam Android app](https://github.com/toti-s/blender-vc
 - Handheld camera control — rotate and walk with the phone, Blender's camera follows (gyro, or
   6-DoF ARCore tracking on supported phones)
 - Live viewfinder streamed from Blender to the phone (JPEG with Pillow, PNG fallback without)
+- Rendered preview for Python render engines (Cycles, Deadlock (game), ...): look through the phone camera
+  (Numpad 0) in a viewport with Rendered shading and the phone shows exactly that render
+- Movement mapping: pick which phone direction drives the camera's forward, right and up (or turn one off),
+  relative to the camera's heading or the world axes, with a move scale
 - Change focal length, depth of field (focus distance / f-stop) from the phone
 - Start/stop keyframe recording from the phone — inserts location, rotation and lens keyframes
 - Switch between cameras, recenter, level the horizon, motion smoothing

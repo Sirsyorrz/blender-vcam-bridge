@@ -15,7 +15,7 @@ Use:      3D Viewport > press N > "VCam" tab > Start Server.
 bl_info = {
     "name": "VCam Bridge (Phone Virtual Camera)",
     "author": "VCam",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (3, 6, 0),
     "location": "3D Viewport > Sidebar > VCam",
     "description": "Drive a Blender camera with an Android phone and stream the camera view back live",
@@ -41,7 +41,8 @@ import zlib
 import bpy
 import gpu
 import numpy as np
-from bpy.props import BoolProperty, FloatProperty, IntProperty, PointerProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty
+from bpy_extras.view3d_utils import location_3d_to_region_2d
 from mathutils import Matrix, Quaternion, Vector
 
 # --------------------------------------------------------------------------------------
@@ -63,6 +64,32 @@ TICK_SECONDS = 1.0 / 60.0
 MAX_INCOMING = 1 << 20
 
 ROT_PATHS = {"QUATERNION": "rotation_quaternion", "AXIS_ANGLE": "rotation_axis_angle"}
+
+# Engines drawn by Blender's own draw manager; GPUOffScreen.draw_view3d renders these fine. Python engines
+# (Cycles, Deadlock (game), ...) only draw through their view_draw, so they are captured there instead.
+DRAW_MANAGER_ENGINES = {"BLENDER_EEVEE", "BLENDER_EEVEE_NEXT", "BLENDER_WORKBENCH"}
+
+PHONE_DIRECTIONS = [
+    ("FORWARD", "Phone forward", ""),
+    ("BACK", "Phone back", ""),
+    ("RIGHT", "Phone right", ""),
+    ("LEFT", "Phone left", ""),
+    ("UP", "Phone up", ""),
+    ("DOWN", "Phone down", ""),
+    ("OFF", "Off", ""),
+]
+
+
+def phone_component(local, direction):
+    """local: movement in the phone's heading frame (x right, y forward, z up)."""
+    return {
+        "FORWARD": local.y,
+        "BACK": -local.y,
+        "RIGHT": local.x,
+        "LEFT": -local.x,
+        "UP": local.z,
+        "DOWN": -local.z,
+    }.get(direction, 0.0)
 
 
 def pack_msg(msg_type, payload):
@@ -121,6 +148,18 @@ def encode_png(arr):
     )
 
 
+def linear_to_display(arr, exposure, gamma):
+    """Scene-linear float RGBA -> sRGB uint8. Approximates Blender's view transform as Standard."""
+    c = np.clip(arr[:, :, :3] * (2.0 ** exposure), 0.0, 1.0)
+    c = np.where(c <= 0.0031308, c * 12.92, 1.055 * np.power(c, 1.0 / 2.4) - 0.055)
+    if abs(gamma - 1.0) > 1e-4:
+        c = np.power(c, 1.0 / gamma)
+    out = np.empty(arr.shape[:2] + (4,), np.uint8)
+    out[:, :, :3] = (c * 255.0 + 0.5).astype(np.uint8)
+    out[:, :, 3] = 255
+    return out
+
+
 def encode_frame(arr, quality):
     """arr: uint8 array (h, w, 4), top row first. Returns JPEG (Pillow) or PNG bytes."""
     if Image is not None:
@@ -132,12 +171,14 @@ def encode_frame(arr, quality):
 
 
 class RawFrame:
-    def __init__(self, arr, quality):
+    def __init__(self, arr, quality, linear=None):
         self.arr = arr
         self.quality = quality
+        self.linear = linear  # (exposure, gamma) when arr is scene-linear float
 
     def encode(self):
-        return encode_frame(self.arr, self.quality)
+        arr = self.arr if self.linear is None else linear_to_display(self.arr, *self.linear)
+        return encode_frame(arr, self.quality)
 
 
 def buffer_to_numpy(buf, w, h):
@@ -153,6 +194,72 @@ def buffer_to_numpy(buf, w, h):
         arr = np.array(buf.to_list(), dtype=np.uint8)
     arr = arr.reshape(h, w, 4)
     return np.ascontiguousarray(arr[::-1]), slow  # the copy also detaches us from the GPU buffer
+
+
+def float_buffer_to_numpy(buf, w, h):
+    try:
+        arr = np.frombuffer(buf, dtype=np.float32)
+        if arr.size != w * h * 4:
+            raise ValueError("unexpected buffer size")
+    except Exception:
+        buf.dimensions = w * h * 4
+        arr = np.array(buf.to_list(), dtype=np.float32)
+    return np.ascontiguousarray(arr.reshape(h, w, 4)[::-1])
+
+
+def camera_frame_rect(scene, cam, region, rv3d):
+    """The camera frame's (x0, y0, x1, y1) in region pixels, for a viewport looking through the camera."""
+    xs, ys = [], []
+    for corner in cam.data.view_frame(scene=scene):
+        co = location_3d_to_region_2d(region, rv3d, cam.matrix_world @ corner)
+        if co is None:
+            return None
+        xs.append(co.x)
+        ys.append(co.y)
+    if max(xs) - min(xs) < 2 or max(ys) - min(ys) < 2:
+        return None
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+_patched_engines = {}
+
+
+def python_engine_classes(idname):
+    return [
+        cls
+        for cls in bpy.types.RenderEngine.__subclasses__()
+        if getattr(cls, "bl_idname", None) == idname and callable(getattr(cls, "view_draw", None))
+    ]
+
+
+def _wrap_view_draw(original):
+    # Exactly (self, context, depsgraph): Blender sizes the call from co_argcount, so an extra defaulted
+    # parameter is passed as NULL and crashes it.
+    def view_draw(self, context, depsgraph):
+        original(self, context, depsgraph)
+        if BRIDGE.running:
+            BRIDGE.capture_engine_view(original, self, context, depsgraph)
+
+    return view_draw
+
+
+def patch_engine(idname):
+    """Wrap a Python render engine's view_draw so the rendered viewport can be streamed to the phone."""
+    if idname in DRAW_MANAGER_ENGINES:
+        return False
+    classes = python_engine_classes(idname)
+    for cls in classes:
+        if cls in _patched_engines:
+            continue
+        _patched_engines[cls] = cls.view_draw
+        cls.view_draw = _wrap_view_draw(cls.view_draw)
+    return bool(classes)
+
+
+def unpatch_engines():
+    for cls, original in _patched_engines.items():
+        cls.view_draw = original
+    _patched_engines.clear()
 
 
 # --------------------------------------------------------------------------------------
@@ -336,6 +443,11 @@ class Bridge:
         self.draw_handle = None
         self.offscreen = None
         self.off_size = None
+        self.cap_offscreen = None
+        self.cap_size = None
+        self.engine_captures = False
+        self.last_capture_t = 0.0
+        self.capture_hint = ""
         self.last_frame_t = 0.0
         self.last_status_t = 0.0
         self.last_redraw_t = 0.0
@@ -352,7 +464,8 @@ class Bridge:
         self.recenter_pending = False
         self.origin_set = False
         self.yaw_q = Quaternion((1.0, 0.0, 0.0, 0.0))
-        self.origin_pos = Vector((0.0, 0.0, 0.0))
+        self.pos = Vector((0.0, 0.0, 0.0))
+        self.prev_pp = None
         self.sm_q = None
         self.sm_p = None
 
@@ -408,13 +521,16 @@ class Bridge:
             except Exception:
                 pass
             self.draw_handle = None
-        if self.offscreen is not None:
+        unpatch_engines()
+        for off in (self.offscreen, self.cap_offscreen):
             try:
-                self.offscreen.free()
+                if off is not None:
+                    off.free()
             except Exception:
                 pass
-            self.offscreen = None
-            self.off_size = None
+        self.offscreen = self.cap_offscreen = None
+        self.off_size = self.cap_size = None
+        self.engine_captures = False
         if bpy.app.timers.is_registered(_tick):
             bpy.app.timers.unregister(_tick)
         self.recording = False
@@ -514,6 +630,7 @@ class Bridge:
         if not self.running:
             return None
         try:
+            self.engine_captures = patch_engine(bpy.context.scene.render.engine)
             self._drain_commands()
             self._apply_pose()
             self._record_tick()
@@ -522,6 +639,9 @@ class Bridge:
             if c is not None and now - self.last_status_t > 0.25:
                 self.last_status_t = now
                 c.send_json(self._status())
+                if self.engine_captures and self.capture_hint and now - self.last_frame_t > 3.0:
+                    self.toast(self.capture_hint)
+                    self.last_frame_t = now  # repeat the hint every few seconds, not every status
             self._redraw(now)
         except Exception:
             self.last_error = traceback.format_exc(limit=4)
@@ -538,7 +658,8 @@ class Bridge:
             for area in window.screen.areas:
                 if area.type == "VIEW_3D":
                     area.tag_redraw()
-                    break  # one 3D view per window is enough to drive the offscreen render
+                    if not self.engine_captures:
+                        break  # one 3D view per window is enough to drive the offscreen render
 
     def _status(self):
         scene = bpy.context.scene
@@ -679,22 +800,42 @@ class Bridge:
                 # Make the phone's current pose coincide with the camera's current pose (yaw + position only).
                 yaw = heading_of(rot0) - heading_of(qp)
                 self.yaw_q = Quaternion((0.0, 0.0, 1.0), yaw)
-                self.origin_pos = loc0 - (self.yaw_q @ pp)
+                self.pos = loc0.copy()
             else:
                 self.yaw_q = Quaternion((1.0, 0.0, 0.0, 0.0))
-                self.origin_pos = Vector((0.0, 0.0, 0.0))
+                self.pos = pp.copy()
+            self.prev_pp = pp.copy()
             self.origin_set = True
             self.recenter_pending = False
             self.sm_q = self.sm_p = None
 
         q = self.yaw_q @ qp
-        pos = self.origin_pos + self.yaw_q @ pp
-        if not p.use_position:
-            pos = loc0
+        phone_heading = heading_of(q)
         if not p.use_rotation:
             q = rot0
         if p.level_horizon:
             q = level_quaternion(q)
+
+        # Position is integrated from deltas so each phone direction can be remapped, relative to where the
+        # phone faces. With the default mapping this equals the absolute phone position.
+        delta = self.yaw_q @ (pp - self.prev_pp)
+        self.prev_pp = pp.copy()
+        # heading_of is measured from +X; the local frame has forward on +Y.
+        local = Quaternion((0.0, 0.0, 1.0), math.pi / 2 - phone_heading) @ delta
+        moved = Vector(
+            (
+                phone_component(local, p.move_right),
+                phone_component(local, p.move_forward),
+                phone_component(local, p.move_up),
+            )
+        ) * p.move_scale
+        if p.move_space == "CAMERA":
+            moved = Quaternion((0.0, 0.0, 1.0), heading_of(q) - math.pi / 2) @ moved
+        if p.use_position:
+            self.pos += moved
+        else:
+            self.pos = loc0.copy()
+        pos = self.pos.copy()
 
         smooth = p.smoothing
         if self.sm_q is None or smooth <= 0.001:
@@ -762,6 +903,8 @@ class Bridge:
         if space is None or space.type != "VIEW_3D":
             return
         now = time.perf_counter()
+        if self.engine_captures and (space.shading.type == "RENDERED" or now - self.last_capture_t < 1.0):
+            return  # draw_view3d can't run a Python engine; capture_engine_view streams that view
         if now - self.last_frame_t < 0.9 / max(5, p.stream_fps):
             return
         cam = self.target_camera()
@@ -787,6 +930,57 @@ class Bridge:
         self.slow_readback = slow
         self.last_frame_t = now
         client.push_frame(RawFrame(arr, p.jpeg_quality))
+
+    def capture_engine_view(self, draw, engine, context, depsgraph):
+        """Runs inside a Python engine's view_draw. Draws the engine a second time into a small offscreen whose
+        viewport is placed so the camera frame fills it: no full-resolution readback."""
+        try:
+            client = self.client
+            p = self.props()
+            if client is None or not p.stream_enabled or client.frame_pending():
+                return
+            region, rv3d = context.region, context.region_data
+            scene = context.scene
+            cam = self.target_camera()
+            if rv3d is None or cam is None:
+                return
+            if rv3d.view_perspective != "CAMERA" or scene.camera != cam:
+                self.capture_hint = "Look through the phone camera (Numpad 0) in a Rendered viewport"
+                return
+            now = time.perf_counter()
+            if now - self.last_frame_t < 0.9 / max(5, p.stream_fps):
+                return
+            rect = camera_frame_rect(scene, cam, region, rv3d)
+            if rect is None:
+                return
+            x0, y0, x1, y1 = rect
+            w, h = self.stream_dims(scene, p)
+            if self.cap_offscreen is None or self.cap_size != (w, h):
+                if self.cap_offscreen is not None:
+                    self.cap_offscreen.free()
+                self.cap_offscreen = gpu.types.GPUOffScreen(w, h, format="RGBA16F")
+                self.cap_size = (w, h)
+            sx, sy = w / (x1 - x0), h / (y1 - y0)
+            saved_viewport = gpu.state.viewport_get()
+            with self.cap_offscreen.bind():
+                fb = gpu.state.active_framebuffer_get()
+                fb.clear(color=(0.0, 0.0, 0.0, 1.0), depth=1.0)
+                gpu.state.viewport_set(
+                    int(round(-x0 * sx)), int(round(-y0 * sy)),
+                    int(round(region.width * sx)), int(round(region.height * sy)),
+                )
+                draw(engine, context, depsgraph)
+                buf = fb.read_color(0, 0, w, h, 4, 0, "FLOAT")
+            gpu.state.viewport_set(*saved_viewport)
+            vs = scene.view_settings
+            self.capture_hint = ""
+            self.last_frame_t = self.last_capture_t = now
+            client.push_frame(RawFrame(float_buffer_to_numpy(buf, w, h), p.jpeg_quality, (vs.exposure, vs.gamma)))
+        except Exception:
+            err = traceback.format_exc(limit=3)
+            if err != self.last_error:
+                self.last_error = err
+                print("[VCam] rendered preview error:\n" + err)
 
 
 BRIDGE = Bridge()
@@ -831,6 +1025,30 @@ class VCamProps(bpy.types.PropertyGroup):
     )
     use_position: BoolProperty(name="Position", default=True)
     use_rotation: BoolProperty(name="Rotation", default=True)
+    move_forward: EnumProperty(
+        name="Forward", items=PHONE_DIRECTIONS, default="FORWARD",
+        description="Phone movement that moves the camera forward",
+    )
+    move_right: EnumProperty(
+        name="Right", items=PHONE_DIRECTIONS, default="RIGHT",
+        description="Phone movement that moves the camera right",
+    )
+    move_up: EnumProperty(
+        name="Up", items=PHONE_DIRECTIONS, default="UP",
+        description="Phone movement that moves the camera up",
+    )
+    move_space: EnumProperty(
+        name="Relative to",
+        items=[
+            ("CAMERA", "Camera", "Forward is where the camera faces (flattened to the ground)"),
+            ("WORLD", "World", "Forward is world +Y, right +X, up +Z"),
+        ],
+        default="CAMERA",
+    )
+    move_scale: FloatProperty(
+        name="Move scale", default=1.0, min=0.0, soft_max=20.0,
+        description="Blender metres per metre the phone moves (joysticks included)",
+    )
 
 
 class VCAM_OT_start(bpy.types.Operator):
@@ -963,6 +1181,15 @@ class VCAM_PT_main(bpy.types.Panel):
         box.operator("vcam.recenter", icon="FILE_REFRESH")
 
         box = layout.box()
+        box.label(text="Movement")
+        col = box.column(align=True)
+        col.prop(p, "move_forward")
+        col.prop(p, "move_right")
+        col.prop(p, "move_up")
+        box.prop(p, "move_space", expand=True)
+        box.prop(p, "move_scale")
+
+        box = layout.box()
         box.label(text="Preview")
         box.prop(p, "stream_enabled")
         col = box.column(align=True)
@@ -976,6 +1203,11 @@ class VCAM_PT_main(bpy.types.Panel):
             box.label(text="Slow GPU readback path in use", icon="ERROR")
         if b.running:
             box.label(text="Keep a 3D viewport visible while streaming")
+            if b.engine_captures and b.capture_hint and time.perf_counter() - b.last_capture_t > 1.0:
+                col = box.column(align=True)
+                col.label(text="Rendered preview: look through", icon="INFO")
+                col.label(text="the camera (Numpad 0) with")
+                col.label(text="Rendered viewport shading")
 
         box = layout.box()
         box.label(text="Recording")

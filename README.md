@@ -15,6 +15,9 @@ Works with the **[Blender VCam Android app](https://github.com/toti-s/blender-vc
   (Numpad 0) in a viewport with Rendered shading and the phone shows exactly that render
 - Movement mapping: pick which phone direction drives the camera's forward, right and up (or turn one off),
   relative to the camera's heading or the world axes, with a move scale
+- Position jitter filter (One Euro: steady when still, responsive when moving), tuned in phone metres so it
+  behaves the same at any move scale; rotation smoothing stays separate
+- Tracking jumps (ARCore relocalising after lost tracking) are ignored instead of teleporting the camera
 - Change focal length, depth of field (focus distance / f-stop) from the phone
 - Start/stop keyframe recording from the phone — inserts location, rotation and lens keyframes
 - Switch between cameras, recenter, level the horizon, motion smoothing

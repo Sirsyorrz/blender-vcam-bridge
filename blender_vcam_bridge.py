@@ -80,6 +80,38 @@ PHONE_DIRECTIONS = [
 ]
 
 
+class OneEuroFilter:
+    """Casiez et al. 2012: heavy smoothing when nearly still (kills tracking jitter), little when moving
+    fast (no lag). min_cutoff in Hz, beta per m/s of speed."""
+
+    D_CUTOFF = 1.0
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.x = None
+        self.dx = Vector((0.0, 0.0, 0.0))
+        self.t = 0.0
+
+    @staticmethod
+    def _alpha(cutoff, dt):
+        tau = 1.0 / (2.0 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def filter(self, x, t, min_cutoff, beta):
+        if self.x is None:
+            self.x, self.t = x.copy(), t
+            self.dx = Vector((0.0, 0.0, 0.0))
+            return x.copy()
+        dt = max(t - self.t, 1e-3)
+        self.t = t
+        self.dx = self.dx.lerp((x - self.x) / dt, self._alpha(self.D_CUTOFF, dt))
+        cutoff = max(1e-3, min_cutoff + beta * self.dx.length)
+        self.x = self.x.lerp(x, self._alpha(cutoff, dt))
+        return self.x.copy()
+
+
 def phone_component(local, direction):
     """local: movement in the phone's heading frame (x right, y forward, z up)."""
     return {
@@ -466,8 +498,15 @@ class Bridge:
         self.yaw_q = Quaternion((1.0, 0.0, 0.0, 0.0))
         self.pos = Vector((0.0, 0.0, 0.0))
         self.prev_pp = None
+        self.raw_prev = None
+        self.pos_filter = OneEuroFilter()
+        self.jumps = 0
         self.sm_q = None
-        self.sm_p = None
+
+    def reset_smoothing(self):
+        self.sm_q = None
+        self.pos_filter.reset()
+        self.prev_pp = None
 
     # ---- lifecycle ---------------------------------------------------------------
     def start(self, port):
@@ -586,7 +625,7 @@ class Bridge:
 
     def set_pose(self, values):
         with self.lock:
-            self.pose = values
+            self.pose = (values, time.perf_counter())
 
     def _client_closed(self, client):
         with self.lock:
@@ -714,7 +753,7 @@ class Bridge:
                 if self.recording:
                     self.recording = False
                 self.origin_set = False
-                self.sm_q = self.sm_p = None
+                self.reset_smoothing()
             return
         if client is not self.client:
             return
@@ -722,7 +761,7 @@ class Bridge:
             client.device = str(msg.get("device") or client.device)[:40]
             self._apply_stream(msg.get("stream") or {}, p)
             self.origin_set = False
-            self.sm_q = self.sm_p = None
+            self.reset_smoothing()
             with self.lock:
                 self.pose = None
             self._send_cameras()
@@ -750,7 +789,7 @@ class Bridge:
                 p.camera = obj
                 bpy.context.scene.camera = obj
                 self.origin_set = False
-                self.sm_q = self.sm_p = None
+                self.reset_smoothing()
                 self._send_cameras()
         elif cmd == "set":
             cam = self.target_camera()
@@ -787,12 +826,26 @@ class Bridge:
         if cam is None:
             return
         p = self.props()
-        px, py, pz, qw, qx, qy, qz = pose
+        (px, py, pz, qw, qx, qy, qz), t = pose
         qp = Quaternion((qw, qx, qy, qz))
         if qp.magnitude < 1e-6:
             return
         qp.normalize()
-        pp = Vector((px, py, pz))
+        raw = Vector((px, py, pz))
+
+        # ARCore relocalising after lost tracking moves the pose in one step: continue from where we were.
+        if self.raw_prev is not None and (raw - self.raw_prev).length > p.jump_limit:
+            self.jumps += 1
+            self.pos_filter.reset()
+            self.prev_pp = None
+        self.raw_prev = raw.copy()
+        # Filtered in phone metres, before move_scale, so the settings don't depend on the scene's scale.
+        if p.filter_position:
+            pp = self.pos_filter.filter(raw, t, p.filter_min_cutoff, p.filter_beta)
+        else:
+            pp = raw
+        if self.prev_pp is None:
+            self.prev_pp = pp.copy()
 
         loc0, rot0, scale0 = cam.matrix_world.decompose()
         if self.recenter_pending or not self.origin_set:
@@ -807,7 +860,7 @@ class Bridge:
             self.prev_pp = pp.copy()
             self.origin_set = True
             self.recenter_pending = False
-            self.sm_q = self.sm_p = None
+            self.sm_q = None
 
         q = self.yaw_q @ qp
         phone_heading = heading_of(q)
@@ -839,14 +892,13 @@ class Bridge:
 
         smooth = p.smoothing
         if self.sm_q is None or smooth <= 0.001:
-            self.sm_q, self.sm_p = q.copy(), pos.copy()
+            self.sm_q = q.copy()
         else:
             a = max(0.03, 1.0 - smooth)
             if self.sm_q.dot(q) < 0.0:
                 q.negate()
             self.sm_q = self.sm_q.slerp(q, a)
-            self.sm_p = self.sm_p.lerp(pos, a)
-        set_world_matrix(cam, Matrix.LocRotScale(self.sm_p, self.sm_q, scale0))
+        set_world_matrix(cam, Matrix.LocRotScale(pos, self.sm_q, scale0))
 
     # ---- recording ---------------------------------------------------------------
     def start_recording(self):
@@ -1018,7 +1070,26 @@ class VCamProps(bpy.types.PropertyGroup):
     stream_width: IntProperty(name="Preview width", default=640, min=160, max=1920, subtype="PIXEL")
     stream_fps: IntProperty(name="Preview FPS", default=30, min=5, max=60)
     jpeg_quality: IntProperty(name="JPEG quality", default=70, min=20, max=95)
-    smoothing: FloatProperty(name="Smoothing", default=0.25, min=0.0, max=0.95, subtype="FACTOR")
+    smoothing: FloatProperty(
+        name="Rotation smoothing", default=0.25, min=0.0, max=0.95, subtype="FACTOR",
+        description="Also set by the phone's Smoothing slider",
+    )
+    filter_position: BoolProperty(
+        name="Filter position jitter", default=True,
+        description="One Euro filter on the phone's position: steady when still, responsive when moving",
+    )
+    filter_min_cutoff: FloatProperty(
+        name="Steadiness", default=1.0, min=0.01, soft_max=10.0, unit="NONE",
+        description="Cutoff in Hz while still. Lower = steadier but more lag on slow moves",
+    )
+    filter_beta: FloatProperty(
+        name="Speed response", default=3.0, min=0.0, soft_max=30.0,
+        description="How fast the filter opens up with speed. Higher = less lag on quick moves, more jitter",
+    )
+    jump_limit: FloatProperty(
+        name="Jump limit", default=0.5, min=0.01, soft_max=5.0, subtype="DISTANCE",
+        description="Phone moves bigger than this in one update (tracking recovered) are ignored",
+    )
     level_horizon: BoolProperty(name="Level horizon", description="Remove roll from the phone's rotation", default=False)
     auto_recenter: BoolProperty(
         name="Auto recenter on connect", description="Start from the camera's current pose", default=True
@@ -1046,7 +1117,7 @@ class VCamProps(bpy.types.PropertyGroup):
         default="CAMERA",
     )
     move_scale: FloatProperty(
-        name="Move scale", default=1.0, min=0.0, soft_max=20.0,
+        name="Move scale", default=1.0, min=0.0, soft_max=100.0,
         description="Blender metres per metre the phone moves (joysticks included)",
     )
 
@@ -1188,6 +1259,14 @@ class VCAM_PT_main(bpy.types.Panel):
         col.prop(p, "move_up")
         box.prop(p, "move_space", expand=True)
         box.prop(p, "move_scale")
+        box.prop(p, "filter_position")
+        col = box.column(align=True)
+        col.active = p.filter_position
+        col.prop(p, "filter_min_cutoff")
+        col.prop(p, "filter_beta")
+        box.prop(p, "jump_limit")
+        if b.jumps:
+            box.label(text="Tracking jumps ignored: %d" % b.jumps)
 
         box = layout.box()
         box.label(text="Preview")
